@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
+import joblib
+
 from src.churn_analysis import compute_churn_risk
+from src.feature_engineering import create_ticket_text
 
 # --------------------------------------------------
 # Page configuration
@@ -11,7 +14,7 @@ st.set_page_config(
 )
 
 # --------------------------------------------------
-# Title and context
+# Title and description
 # --------------------------------------------------
 st.title("Support Operations Dashboard")
 
@@ -24,69 +27,61 @@ The focus of this system is operational visibility and decision support.
 """)
 
 # --------------------------------------------------
+# Load trained model and vectorizer
+# --------------------------------------------------
+@st.cache_resource
+def load_model():
+    model = joblib.load("models/priority_model.pkl")
+    vectorizer = joblib.load("models/vectorizer.pkl")
+    return model, vectorizer
+
+
+model, vectorizer = load_model()
+
+# --------------------------------------------------
+# Sidebar upload
+# --------------------------------------------------
+uploaded_file = st.sidebar.file_uploader(
+    "Upload support tickets CSV",
+    type=["csv"]
+)
+
+# --------------------------------------------------
 # Load data
 # --------------------------------------------------
 @st.cache_data
-def load_data():
-    df = pd.read_csv("data/raw/tickets.csv")
+def load_data(uploaded_file=None):
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_csv("data/raw/tickets.csv")
 
+    # Clean column names
     df.columns = (
         df.columns
         .str.strip()
         .str.lower()
         .str.replace(" ", "_")
     )
-    from src.feature_engineering import create_ticket_text
-    df = create_ticket_text(df)
 
+    # Create combined ticket text
+    df = create_ticket_text(df)
 
     return df
 
 
-df = load_data()
+df = load_data(uploaded_file)
+
+# --------------------------------------------------
+# Compute churn risk
+# --------------------------------------------------
 df = compute_churn_risk(df)
 
 # --------------------------------------------------
-# Recreate churn logic using business rules
+# Predict ticket priority using saved ML model
 # --------------------------------------------------
-
-# Convert date columns
-df['date_of_purchase'] = pd.to_datetime(df['date_of_purchase'], errors='coerce')
-df['time_to_resolution'] = pd.to_datetime(df['time_to_resolution'], errors='coerce')
-
-# Calculate resolution time in hours
-df['resolution_time_hours'] = (
-    df['time_to_resolution'] - df['date_of_purchase']
-).dt.total_seconds() / 3600
-
-# Cap unrealistic values
-df['resolution_time_hours_capped'] = df['resolution_time_hours'].clip(upper=2160)
-
-# Business indicators
-df['low_satisfaction'] = df['customer_satisfaction_rating'] <= 2
-df['high_priority_flag'] = df['ticket_priority'].isin(['High', 'Critical'])
-df['long_resolution_flag'] = df['resolution_time_hours_capped'] > 72
-
-ticket_counts = df.groupby('customer_email').size()
-df['repeat_customer_flag'] = df['customer_email'].map(ticket_counts) > 3
-
-# Churn score calculation
-df['churn_score'] = (
-    df['low_satisfaction'].fillna(False).astype(int) +
-    df['high_priority_flag'].astype(int) +
-    df['long_resolution_flag'].astype(int) +
-    df['repeat_customer_flag'].astype(int)
-)
-
-def churn_label(score):
-    if score >= 3:
-        return "High"
-    elif score == 2:
-        return "Medium"
-    else:
-        return "Low"
-
-df['churn_risk'] = df['churn_score'].apply(churn_label)
+X_vectorized = vectorizer.transform(df["ticket_text"])
+df["predicted_priority"] = model.predict(X_vectorized)
 
 # --------------------------------------------------
 # Sidebar filters
@@ -94,83 +89,100 @@ df['churn_risk'] = df['churn_score'].apply(churn_label)
 st.sidebar.header("Filters")
 
 priority_filter = st.sidebar.multiselect(
-    "Ticket priority",
-    options=df['ticket_priority'].unique(),
-    default=df['ticket_priority'].unique()
+    "Ticket Priority",
+    options=sorted(df["ticket_priority"].dropna().unique()),
+    default=sorted(df["ticket_priority"].dropna().unique())
 )
 
 churn_filter = st.sidebar.multiselect(
-    "Churn risk level",
-    options=df['churn_risk'].unique(),
-    default=df['churn_risk'].unique()
+    "Churn Risk Level",
+    options=["Low", "Medium", "High"],
+    default=["Low", "Medium", "High"]
 )
 
 filtered_df = df[
-    (df['ticket_priority'].isin(priority_filter)) &
-    (df['churn_risk'].isin(churn_filter))
+    (df["ticket_priority"].isin(priority_filter)) &
+    (df["churn_risk"].isin(churn_filter))
 ]
 
 # --------------------------------------------------
-# Key metrics
+# KPI metrics
 # --------------------------------------------------
-st.markdown("### Current Overview")
+st.subheader("Current Overview")
 
 col1, col2, col3 = st.columns(3)
 
-col1.metric(
-    "Active tickets",
-    len(filtered_df)
-)
+with col1:
+    st.metric("Active Tickets", len(filtered_df))
 
-col2.metric(
-    "Critical tickets requiring attention",
-    (filtered_df['ticket_priority'] == 'Critical').sum()
-)
+with col2:
+    st.metric(
+        "Critical Tickets",
+        (filtered_df["ticket_priority"] == "Critical").sum()
+    )
 
-col3.metric(
-    "Customers at high churn risk",
-    (filtered_df['churn_risk'] == 'High').sum()
-)
+with col3:
+    st.metric(
+        "High-Risk Customers",
+        (filtered_df["churn_risk"] == "High").sum()
+    )
 
 # --------------------------------------------------
-# High churn risk customers
+# High-risk customer section
 # --------------------------------------------------
-st.markdown("### Customers Requiring Immediate Follow-up")
+st.subheader("Customers Requiring Immediate Follow-up")
 
-st.markdown("""
-The following customers show multiple indicators of dissatisfaction,
-including repeated support requests, long resolution times, or
-high-priority issues. These cases should be reviewed proactively.
-""")
+high_risk_df = filtered_df[
+    filtered_df["churn_risk"] == "High"
+]
 
-high_risk_df = filtered_df[filtered_df['churn_risk'] == 'High']
+if len(high_risk_df) > 0:
+    st.dataframe(
+        high_risk_df[
+            [
+                "customer_email",
+                "ticket_priority",
+                "predicted_priority",
+                "customer_satisfaction_rating",
+                "ticket_status",
+                "churn_risk"
+            ]
+        ],
+        use_container_width=True
+    )
+
+    st.download_button(
+        label="Export High-Risk Customers",
+        data=high_risk_df.to_csv(index=False),
+        file_name="high_risk_customers.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("No customers currently match the selected high-risk filters.")
+
+# --------------------------------------------------
+# Full filtered ticket table
+# --------------------------------------------------
+st.subheader("All Filtered Tickets")
 
 st.dataframe(
-    high_risk_df[
+    filtered_df[
         [
-            'customer_email',
-            'ticket_priority',
-            'customer_satisfaction_rating',
-            'ticket_status'
+            "customer_email",
+            "ticket_priority",
+            "predicted_priority",
+            "customer_satisfaction_rating",
+            "ticket_status",
+            "churn_risk"
         ]
     ],
     use_container_width=True
 )
 
 # --------------------------------------------------
-# Export option
-# --------------------------------------------------
-st.download_button(
-    label="Export customers requiring follow-up",
-    data=high_risk_df.to_csv(index=False),
-    file_name="high_churn_customers.csv",
-    mime="text/csv"
-)
-
-# --------------------------------------------------
-# Footer note
+# Footer
 # --------------------------------------------------
 st.caption(
-    "Churn risk is calculated using transparent operational rules rather "
-    "than opaque models to ensure clarity and trust for support teams."
+    "Churn risk is calculated using transparent business rules "
+    "to support decision-making rather than replace human judgment."
 )
