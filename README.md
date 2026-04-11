@@ -135,8 +135,15 @@ These limitations reflect real-world data challenges.
 2. Create and activate a virtual environment  
 3. Install dependencies:  
 pip install -r requirements.txt
-4. Run the dashboard:  
+4. Train priority model and generate evaluation report:  
+python -m src.train_model
+5. Run the dashboard:  
 streamlit run app.py
+
+The training step saves:
+- models/priority_model.pkl
+- models/vectorizer.pkl
+- models/priority_model_metrics.json (validation and test metrics)
 
 
 ---
